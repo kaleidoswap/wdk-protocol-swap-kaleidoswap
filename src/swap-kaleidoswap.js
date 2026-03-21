@@ -15,6 +15,7 @@
 'use strict'
 
 import { SwapProtocol } from '@tetherto/wdk-wallet/protocols'
+import { KaleidoClient } from 'kaleido-sdk'
 
 const CACHE_TTL = 5 * 60 * 1000 // 5 minutes
 
@@ -40,6 +41,7 @@ export default class KaleidoswapProtocol extends SwapProtocol {
     if (!config.baseUrl) throw new Error('KaleidoswapProtocol: config.baseUrl is required')
 
     this._baseUrl = config.baseUrl.replace(/\/$/, '')
+    this._maker = KaleidoClient.create({ baseUrl: this._baseUrl }).maker
     this._cache = null
     this._cacheTime = 0
   }
@@ -56,7 +58,7 @@ export default class KaleidoswapProtocol extends SwapProtocol {
     const fromAsset = await this._getAsset(fromAssetId)
     const rawAmount = toRaw(fromAmount, fromAsset.precision)
 
-    const quote = await this._request('POST', '/api/v1/market/quote', {
+    const quote = await this._maker.getQuote({
       from_asset: {
         asset_id: fromAssetId,
         layer: fromLayer,
@@ -101,7 +103,7 @@ export default class KaleidoswapProtocol extends SwapProtocol {
 
     const rawAmount = toRaw(fromAmount, fromAsset.precision)
 
-    const quote = await this._request('POST', '/api/v1/market/quote', {
+    const quote = await this._maker.getQuote({
       from_asset: {
         asset_id: fromAssetId,
         layer: fromLayer,
@@ -113,7 +115,7 @@ export default class KaleidoswapProtocol extends SwapProtocol {
       }
     })
 
-    const order = await this._request('POST', '/api/v1/swaps/orders', {
+    const order = await this._maker.createSwapOrder({
       rfq_id: quote.rfq_id,
       from_asset: {
         asset_id: quote.from_asset.asset_id,
@@ -156,35 +158,13 @@ export default class KaleidoswapProtocol extends SwapProtocol {
    * @returns {Promise<import('../types/index.d.ts').KaleidoswapOrder>}
    */
   async getOrderStatus (orderId) {
-    const response = await this._request('POST', '/api/v1/swaps/orders/status', {
-      order_id: orderId
-    })
+    const response = await this._maker.getSwapOrderStatus({ order_id: orderId })
     return response.order
   }
 
   // ---------------------------------------------------------------------------
   // Private helpers
   // ---------------------------------------------------------------------------
-
-  /** @private */
-  async _request (method, path, body) {
-    const url = `${this._baseUrl}${path}`
-    const opts = { method, headers: { 'Content-Type': 'application/json' } }
-    if (body !== undefined) opts.body = JSON.stringify(body)
-
-    const res = await fetch(url, opts)
-
-    if (!res.ok) {
-      let message = `HTTP ${res.status}`
-      try {
-        const data = await res.json()
-        message = data?.detail || data?.message || message
-      } catch (_) {}
-      throw new Error(`KaleidoSwap API error: ${message}`)
-    }
-
-    return res.json()
-  }
 
   /** @private */
   async _getAssetsAndPairs () {
@@ -195,8 +175,8 @@ export default class KaleidoswapProtocol extends SwapProtocol {
     }
 
     const [assetsResponse, pairsResponse] = await Promise.all([
-      this._request('GET', '/api/v1/market/assets'),
-      this._request('GET', '/api/v1/market/pairs')
+      this._maker.listAssets(),
+      this._maker.listPairs()
     ])
 
     this._cache = { assets: assetsResponse.assets, pairs: pairsResponse.pairs }

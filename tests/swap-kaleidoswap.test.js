@@ -82,13 +82,20 @@ const MOCK_ORDER_STATUS = {
 
 const DUMMY_ACCOUNT = {}
 
+/**
+ * Sets up a mock fetch returning a sequence of JSON responses, then creates
+ * a new KaleidoswapProtocol. openapi-fetch captures globalThis.fetch at
+ * construction time, so the mock must be set BEFORE creating the protocol.
+ */
 function makeProtocol (baseUrl = 'https://api.staging.kaleidoswap.com') {
   return new KaleidoswapProtocol(DUMMY_ACCOUNT, { baseUrl })
 }
 
 /**
- * Builds a mock fetch that returns the given responses in order,
- * one per call. Installs it on globalThis.
+ * Builds a mock fetch that returns the given responses in order, one per call.
+ * Must be called BEFORE makeProtocol() so openapi-fetch captures the mock.
+ * The mock provides text() (used by openapi-fetch for body parsing) and
+ * the headers/status fields needed by the SDK internals.
  */
 function mockFetchSequence (...responses) {
   let call = 0
@@ -96,7 +103,10 @@ function mockFetchSequence (...responses) {
     const res = responses[call++]
     return Promise.resolve({
       ok: true,
-      json: () => Promise.resolve(res)
+      status: 200,
+      statusText: 'OK',
+      headers: { get: () => null },
+      text: () => Promise.resolve(res !== undefined ? JSON.stringify(res) : '')
     })
   })
 }
@@ -105,8 +115,25 @@ function mockFetchError (status, body) {
   globalThis.fetch = jest.fn().mockResolvedValue({
     ok: false,
     status,
-    json: () => Promise.resolve(body)
+    statusText: 'Error',
+    headers: { get: () => null },
+    text: async () => JSON.stringify(body)
   })
+}
+
+/** Returns the URL from the nth fetch call (openapi-fetch passes a Request object). */
+function getRequestUrl (callIndex = 0) {
+  return globalThis.fetch.mock.calls[callIndex][0].url
+}
+
+/** Returns the method from the nth fetch call. */
+function getRequestMethod (callIndex = 0) {
+  return globalThis.fetch.mock.calls[callIndex][0].method
+}
+
+/** Reads and parses the JSON body from the nth fetch call's Request object. */
+async function getRequestBody (callIndex = 0) {
+  return globalThis.fetch.mock.calls[callIndex][0].json()
 }
 
 // ---------------------------------------------------------------------------
@@ -127,6 +154,7 @@ describe('KaleidoswapProtocol', () => {
     })
 
     test('strips trailing slash from baseUrl', () => {
+      globalThis.fetch = jest.fn() // provide a valid fetch for client creation
       const p = new KaleidoswapProtocol(DUMMY_ACCOUNT, { baseUrl: 'https://api.example.com/' })
       expect(p._baseUrl).toBe('https://api.example.com')
     })
@@ -159,8 +187,7 @@ describe('KaleidoswapProtocol', () => {
       expect(result.fee).toBe(BigInt(500))
 
       // The quote POST must carry the right body
-      const [, , quoteCall] = globalThis.fetch.mock.calls
-      const quoteBody = JSON.parse(quoteCall[1].body)
+      const quoteBody = await getRequestBody(2)
       expect(quoteBody.from_asset.asset_id).toBe(BTC_ASSET_ID)
       expect(quoteBody.from_asset.layer).toBe('BTC_LN')
       // 0.01 BTC with precision 8 → 1_000_000 sats
@@ -201,8 +228,7 @@ describe('KaleidoswapProtocol', () => {
       expect(result.fee).toBe(BigInt(500))
 
       // Order creation payload
-      const [, , , orderCall] = globalThis.fetch.mock.calls
-      const orderBody = JSON.parse(orderCall[1].body)
+      const orderBody = await getRequestBody(3)
       expect(orderBody.rfq_id).toBe('rfq-abc-123')
       expect(orderBody.from_asset.asset_id).toBe(BTC_ASSET_ID)
       expect(orderBody.to_asset.asset_id).toBe(USDT_ASSET_ID)
@@ -240,17 +266,16 @@ describe('KaleidoswapProtocol', () => {
   describe('getOrderStatus()', () => {
     test('POSTs to /api/v1/swaps/orders/status and returns the order object', async () => {
       mockFetchSequence(MOCK_ORDER_STATUS)
-
       const p = makeProtocol()
       const order = await p.getOrderStatus('order-xyz-789')
 
       expect(order.id).toBe('order-xyz-789')
       expect(order.status).toBe('FILLED')
 
-      const [url, opts] = globalThis.fetch.mock.calls[0]
-      expect(url).toContain('/api/v1/swaps/orders/status')
-      expect(opts.method).toBe('POST')
-      expect(JSON.parse(opts.body)).toEqual({ order_id: 'order-xyz-789' })
+      expect(getRequestUrl()).toContain('/api/v1/swaps/orders/status')
+      expect(getRequestMethod()).toBe('POST')
+      const body = await getRequestBody()
+      expect(body).toEqual({ order_id: 'order-xyz-789' })
     })
   })
 
@@ -324,40 +349,31 @@ describe('KaleidoswapProtocol', () => {
 
   // -------------------------------------------------------------------------
   describe('error handling', () => {
-    test('throws a readable error on 4xx with detail field', async () => {
-      globalThis.fetch = jest.fn().mockResolvedValue({
-        ok: false,
-        status: 422,
-        json: () => Promise.resolve({ detail: 'Amount below minimum order size' })
-      })
-
+    test('throws on 4xx with detail field', async () => {
+      mockFetchError(422, { detail: 'Amount below minimum order size' })
       const p = makeProtocol()
       await expect(p.getOrderStatus('bad-id'))
-        .rejects.toThrow('KaleidoSwap API error: Amount below minimum order size')
+        .rejects.toThrow('Amount below minimum order size')
     })
 
-    test('throws a readable error on 5xx with message field', async () => {
-      globalThis.fetch = jest.fn().mockResolvedValue({
-        ok: false,
-        status: 500,
-        json: () => Promise.resolve({ message: 'Internal server error' })
-      })
-
+    test('throws on 5xx with message field', async () => {
+      mockFetchError(500, { message: 'Internal server error' })
       const p = makeProtocol()
       await expect(p.getOrderStatus('bad-id'))
-        .rejects.toThrow('KaleidoSwap API error: Internal server error')
+        .rejects.toThrow('Internal server error')
     })
 
-    test('falls back to HTTP status when body has no detail/message', async () => {
+    test('throws when error response body cannot be read', async () => {
       globalThis.fetch = jest.fn().mockResolvedValue({
         ok: false,
         status: 503,
-        json: () => Promise.reject(new Error('not JSON'))
+        statusText: 'Service Unavailable',
+        headers: { get: () => null },
+        text: () => Promise.reject(new Error('network read failure'))
       })
-
       const p = makeProtocol()
       await expect(p.getOrderStatus('bad-id'))
-        .rejects.toThrow('KaleidoSwap API error: HTTP 503')
+        .rejects.toThrow()
     })
 
     test('throws when asset is not found in catalog', async () => {
