@@ -1,5 +1,5 @@
 {
-  "name": "@kaleidoswap/wdk-protocol-swap-kaleidoswap",
+  "name": "@kaleidorg/wdk-protocol-swap-kaleidoswap",
   "version": "1.0.0-beta.2",
   "description": "WDK swap protocol plugin for KaleidoSwap — trade Bitcoin and RGB assets on the Lightning Network.",
   "keywords": [
