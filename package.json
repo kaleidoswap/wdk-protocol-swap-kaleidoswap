@@ -1,6 +1,6 @@
 {
   "name": "@kaleidorg/wdk-protocol-swap-kaleidoswap",
-  "version": "1.0.0-beta.2",
+  "version": "1.0.0-beta.3",
   "description": "WDK swap protocol plugin for KaleidoSwap — trade Bitcoin and RGB assets on the Lightning Network.",
   "keywords": [
     "wdk",
@@ -30,7 +30,7 @@
     "test:coverage": "cross-env NODE_OPTIONS=--experimental-vm-modules jest --coverage"
   },
   "dependencies": {
-    "kaleido-sdk": "^0.1.0"
+    "kaleido-sdk": "^0.1.15"
   },
   "peerDependencies": {
     "@tetherto/wdk-wallet": "^1.0.0-beta.6"
