@@ -25,14 +25,22 @@ const CACHE_TTL = 5 * 60 * 1000 // 5 minutes
  */
 
 /**
- * WDK SwapProtocol implementation for KaleidoSwap.
+ * WDK SwapProtocol implementation for KaleidoSwap's atomic HTLC swaps.
  *
- * Flow: quoteSwap() → swap() returns a deposit address → user sends funds →
- * server completes the swap. Poll getOrderStatus() for final state.
+ * All amounts cross this API in RAW base units (satoshis for BTC, the
+ * asset's smallest unit for RGB assets), matching the WDK SwapProtocol
+ * contract and the maker wire format. Display-unit conversion is the
+ * host UI's job.
+ *
+ * Flow: quoteSwap() → swap() initiates the swap at the maker, whitelists
+ * the HTLC on the taker's own RLN node (`account`), and confirms
+ * execution. Settlement is atomic over Lightning — no deposit address,
+ * no receiver address. Poll getOrderStatus(paymentHash) for final state.
  */
 export default class KaleidoswapProtocol extends SwapProtocol {
   /**
-   * @param {import('@tetherto/wdk-wallet').IWalletAccount} account
+   * @param {import('@kaleidorg/wdk-wallet-rln').RlnAccount} account - the taker's
+   *        RLN account (must expose atomicTaker + getTakerPubkey)
    * @param {KaleidoswapConfig} config
    */
   constructor (account, config = {}) {
@@ -47,28 +55,26 @@ export default class KaleidoswapProtocol extends SwapProtocol {
   }
 
   /**
-   * Returns a price quote without committing to a swap.
+   * Returns a price quote without committing to a swap. Provide the amount on
+   * exactly one leg: `fromAmount` to sell a fixed input, `toAmount` to buy a
+   * fixed output — both in RAW base units.
    *
-   * @param {{ fromAssetId: string, toAssetId: string, fromLayer: string, toLayer: string, fromAmount: number }} options
+   * @param {{ fromAssetId: string, toAssetId: string, fromLayer: string, toLayer: string, fromAmount?: number | bigint, toAmount?: number | bigint }} options
    * @returns {Promise<{ tokenInAmount: bigint, tokenOutAmount: bigint, rfqId: string, expiresAt: number, price: number, fee: bigint }>}
    */
   async quoteSwap (options) {
-    const { fromAssetId, toAssetId, fromLayer, toLayer, fromAmount } = options
+    const { fromAssetId, toAssetId, fromLayer, toLayer, fromAmount, toAmount } = options
 
-    const fromAsset = await this._getAsset(fromAssetId)
-    const rawAmount = toRaw(fromAmount, fromAsset.precision)
+    if ((fromAmount == null) === (toAmount == null)) {
+      throw new Error('KaleidoswapProtocol: provide exactly one of fromAmount or toAmount (raw base units)')
+    }
 
-    const quote = await this._maker.getQuote({
-      from_asset: {
-        asset_id: fromAssetId,
-        layer: fromLayer,
-        amount: rawAmount
-      },
-      to_asset: {
-        asset_id: toAssetId,
-        layer: toLayer
-      }
-    })
+    const fromLeg = { asset_id: fromAssetId, layer: fromLayer }
+    const toLeg = { asset_id: toAssetId, layer: toLayer }
+    if (fromAmount != null) fromLeg.amount = toRawInt(fromAmount, 'fromAmount')
+    else toLeg.amount = toRawInt(toAmount, 'toAmount')
+
+    const quote = await this._maker.getQuote({ from_asset: fromLeg, to_asset: toLeg })
 
     return {
       tokenInAmount: BigInt(quote.from_asset.amount),
@@ -76,90 +82,72 @@ export default class KaleidoswapProtocol extends SwapProtocol {
       rfqId: quote.rfq_id,
       expiresAt: quote.expires_at,
       price: quote.price,
-      fee: BigInt(quote.fee?.base_fee ?? 0)
+      fee: BigInt(quote.fee?.final_fee ?? quote.fee?.base_fee ?? 0)
     }
   }
 
   /**
-   * Obtains a fresh quote and creates a swap order.
-   * Returns the deposit address the user must send funds to.
+   * Executes an atomic swap for a previously obtained quote:
+   * initiates at the maker, whitelists the HTLC on the taker's RLN node,
+   * then confirms execution. Amounts must be the RAW base-unit amounts
+   * returned by quoteSwap() — the maker binds them to the rfqId.
    *
-   * @param {{ fromAssetId: string, toAssetId: string, fromLayer: string, toLayer: string, fromAmount: number, receiverAddress: string, receiverAddressFormat: string }} options
-   * @returns {Promise<{ hash: string, orderId: string, depositAddress: string|null, depositAddressFormat: string|null, tokenInAmount: bigint, tokenOutAmount: bigint, fee: bigint }>}
+   * The returned `accessToken` is issued ONCE at initiation and is required
+   * to poll getOrderStatus() — persist it alongside the payment hash.
+   *
+   * @param {{ rfqId: string, fromAssetId: string, toAssetId: string, tokenInAmount: number | bigint, tokenOutAmount: number | bigint }} options
+   * @returns {Promise<{ hash: string, paymentHash: string, swapstring: string, accessToken: string | null, status: string, tokenInAmount: bigint, tokenOutAmount: bigint }>}
    */
   async swap (options) {
-    const {
-      fromAssetId,
-      toAssetId,
-      fromLayer,
-      toLayer,
-      fromAmount,
-      receiverAddress,
-      receiverAddressFormat
-    } = options
+    const { rfqId, fromAssetId, toAssetId, tokenInAmount, tokenOutAmount } = options
 
-    const fromAsset = await this._getAsset(fromAssetId)
-    const toAsset = await this._getAsset(toAssetId)
+    if (!rfqId) throw new Error('KaleidoswapProtocol: swap() requires the rfqId from quoteSwap()')
 
-    const rawAmount = toRaw(fromAmount, fromAsset.precision)
-
-    const quote = await this._maker.getQuote({
-      from_asset: {
-        asset_id: fromAssetId,
-        layer: fromLayer,
-        amount: rawAmount
-      },
-      to_asset: {
-        asset_id: toAssetId,
-        layer: toLayer
-      }
+    const init = await this._maker.initSwap({
+      rfq_id: rfqId,
+      from_asset: fromAssetId,
+      from_amount: toRawInt(tokenInAmount, 'tokenInAmount'),
+      to_asset: toAssetId,
+      to_amount: toRawInt(tokenOutAmount, 'tokenOutAmount')
     })
 
-    const order = await this._maker.createSwapOrder({
-      rfq_id: quote.rfq_id,
-      from_asset: {
-        asset_id: quote.from_asset.asset_id,
-        name: quote.from_asset.name,
-        ticker: quote.from_asset.ticker,
-        layer: quote.from_asset.layer,
-        amount: quote.from_asset.amount,
-        precision: fromAsset.precision
-      },
-      to_asset: {
-        asset_id: quote.to_asset.asset_id,
-        name: quote.to_asset.name,
-        ticker: quote.to_asset.ticker,
-        layer: quote.to_asset.layer,
-        amount: quote.to_asset.amount,
-        precision: toAsset.precision
-      },
-      receiver_address: {
-        address: receiverAddress,
-        format: receiverAddressFormat
-      },
-      min_onchain_conf: 1
+    // Whitelist BEFORE confirming execution: once the maker starts the swap
+    // it routes the HTLC immediately, and an un-whitelisted node rejects it.
+    await this._account.atomicTaker(init.swapstring)
+    const takerPubkey = await this._account.getTakerPubkey()
+
+    const confirmed = await this._maker.executeSwap({
+      swapstring: init.swapstring,
+      taker_pubkey: takerPubkey,
+      payment_hash: init.payment_hash
     })
 
     return {
-      hash: order.id,
-      orderId: order.id,
-      depositAddress: order.deposit_address?.address ?? null,
-      depositAddressFormat: order.deposit_address?.format ?? null,
-      tokenInAmount: BigInt(quote.from_asset.amount),
-      tokenOutAmount: BigInt(quote.to_asset.amount),
-      fee: BigInt(quote.fee?.base_fee ?? 0)
+      hash: init.payment_hash,
+      paymentHash: init.payment_hash,
+      swapstring: init.swapstring,
+      accessToken: init.access_token ?? null,
+      // /swaps/execute responds with an HTTP-style {status: 200, message} —
+      // the swap itself starts in 'Waiting'; poll getOrderStatus for truth.
+      status: 'Waiting',
+      tokenInAmount: BigInt(options.tokenInAmount),
+      tokenOutAmount: BigInt(options.tokenOutAmount)
     }
   }
 
   /**
-   * Polls the status of an existing swap order.
+   * Polls the status of an atomic swap.
    *
-   * @param {string} orderId
-   * @returns {Promise<import('../types/index.d.ts').KaleidoswapOrder>}
+   * @param {string} paymentHash
+   * @param {string} [accessToken] - Per-swap token returned by swap()
+   * @returns {Promise<import('../types/index.d.ts').KaleidoswapAtomicSwap>}
    */
-  async getOrderStatus (orderId) {
-    const response = await this._maker.getSwapOrderStatus({ order_id: orderId })
-    return response.order
+  async getOrderStatus (paymentHash, accessToken = '') {
+    const response = await this._maker.getAtomicSwapStatus({
+      payment_hash: paymentHash,
+      access_token: accessToken
+    })
+    return response.swap ?? response
   }
 
   // ---------------------------------------------------------------------------
@@ -185,8 +173,14 @@ export default class KaleidoswapProtocol extends SwapProtocol {
     return this._cache
   }
 
-  /** @private */
-  async _getAsset (assetId) {
+  /**
+   * Resolves an asset (ticker or protocol ID) to its maker listing, exposing
+   * `precision` so hosts can convert raw amounts for display.
+   *
+   * @param {string} assetId
+   * @returns {Promise<{ ticker: string, name: string, precision: number, protocol_ids?: Record<string, string> }>}
+   */
+  async getAsset (assetId) {
     const { assets } = await this._getAssetsAndPairs()
 
     const asset = assets.find(a =>
@@ -200,7 +194,19 @@ export default class KaleidoswapProtocol extends SwapProtocol {
   }
 }
 
-/** @param {number} amount @param {number} precision */
-function toRaw (amount, precision) {
-  return Math.round(amount * Math.pow(10, precision))
+/**
+ * Coerces a raw base-unit amount to a safe positive integer for the wire.
+ * Rejects fractions: a fractional value here means the caller passed display
+ * units, which silently scales the order by 10^precision.
+ *
+ * @param {number | bigint} amount
+ * @param {string} field
+ * @returns {number}
+ */
+function toRawInt (amount, field) {
+  const n = Number(amount)
+  if (!Number.isSafeInteger(n) || n <= 0) {
+    throw new Error(`KaleidoswapProtocol: ${field} must be a positive integer in raw base units, got ${String(amount)}`)
+  }
+  return n
 }

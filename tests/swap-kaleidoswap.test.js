@@ -20,7 +20,7 @@ const MOCK_ASSETS = [
   {
     ticker: 'USDT',
     name: 'Tether USD',
-    precision: 8,
+    precision: 6,
     protocol_ids: { RGB: USDT_ASSET_ID }
   }
 ]
@@ -28,7 +28,7 @@ const MOCK_ASSETS = [
 const MOCK_PAIRS = [
   {
     base: { ticker: 'BTC', name: 'Bitcoin', precision: 8, protocol_ids: { BTC: 'BTC' } },
-    quote: { ticker: 'USDT', name: 'Tether USD', precision: 8, protocol_ids: { RGB: USDT_ASSET_ID } },
+    quote: { ticker: 'USDT', name: 'Tether USD', precision: 6, protocol_ids: { RGB: USDT_ASSET_ID } },
     routes: [{ from_layer: 'BTC_LN', to_layer: 'RGB_LN' }]
   }
 ]
@@ -49,30 +49,30 @@ const MOCK_QUOTE = {
     ticker: 'USDT',
     layer: 'RGB_LN',
     amount: 950000000,
-    precision: 8
+    precision: 6
   },
   price: 95000,
-  fee: { base_fee: 500, proportional_fee: 0 },
+  fee: { base_fee: 500, variable_fee: 100, final_fee: 600 },
   timestamp: 1700000000,
   expires_at: 1700000060
 }
 
-const MOCK_ORDER = {
-  id: 'order-xyz-789',
-  rfq_id: 'rfq-abc-123',
-  status: 'PENDING',
-  deposit_address: { address: 'lnbc10u1p...', format: 'BOLT11' }
+const MOCK_INIT = {
+  payment_hash: 'ph-abc-123',
+  swapstring: 'swapstr-abc-123',
+  access_token: 'swap_tok_1'
 }
 
-const MOCK_ORDER_STATUS = {
-  order: {
-    id: 'order-xyz-789',
-    rfq_id: 'rfq-abc-123',
-    status: 'FILLED',
-    from_asset: MOCK_QUOTE.from_asset,
-    to_asset: MOCK_QUOTE.to_asset,
-    price: MOCK_QUOTE.price,
-    deposit_address: MOCK_ORDER.deposit_address
+const MOCK_EXECUTE = {
+  status: 'Waiting'
+}
+
+const MOCK_ATOMIC_STATUS = {
+  swap: {
+    payment_hash: 'ph-abc-123',
+    status: 'Succeeded',
+    qty_from: 1000000,
+    qty_to: 950000000
   }
 }
 
@@ -80,22 +80,26 @@ const MOCK_ORDER_STATUS = {
 // Helpers
 // ---------------------------------------------------------------------------
 
-const DUMMY_ACCOUNT = {}
+/** Taker-account mock covering the surface swap() relies on. */
+function makeAccount () {
+  return {
+    atomicTaker: jest.fn().mockResolvedValue(undefined),
+    getTakerPubkey: jest.fn().mockResolvedValue('02deadbeef')
+  }
+}
 
 /**
  * Sets up a mock fetch returning a sequence of JSON responses, then creates
  * a new KaleidoswapProtocol. openapi-fetch captures globalThis.fetch at
  * construction time, so the mock must be set BEFORE creating the protocol.
  */
-function makeProtocol (baseUrl = 'https://api.staging.kaleidoswap.com') {
-  return new KaleidoswapProtocol(DUMMY_ACCOUNT, { baseUrl })
+function makeProtocol (account = makeAccount(), baseUrl = 'https://api.staging.kaleidoswap.com') {
+  return new KaleidoswapProtocol(account, { baseUrl })
 }
 
 /**
  * Builds a mock fetch that returns the given responses in order, one per call.
  * Must be called BEFORE makeProtocol() so openapi-fetch captures the mock.
- * The mock provides text() (used by openapi-fetch for body parsing) and
- * the headers/status fields needed by the SDK internals.
  */
 function mockFetchSequence (...responses) {
   let call = 0
@@ -136,214 +140,229 @@ async function getRequestBody (callIndex = 0) {
   return globalThis.fetch.mock.calls[callIndex][0].json()
 }
 
+const QUOTE_OPTS = {
+  fromAssetId: BTC_ASSET_ID,
+  toAssetId: USDT_ASSET_ID,
+  fromLayer: 'BTC_LN',
+  toLayer: 'RGB_LN',
+  fromAmount: 1_000_000 // raw sats
+}
+
+const SWAP_OPTS = {
+  rfqId: 'rfq-abc-123',
+  fromAssetId: BTC_ASSET_ID,
+  toAssetId: USDT_ASSET_ID,
+  tokenInAmount: 1_000_000,
+  tokenOutAmount: 950_000_000
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 describe('KaleidoswapProtocol', () => {
   beforeEach(() => {
-    // Reset fetch mock between tests
     globalThis.fetch = undefined
   })
 
   // -------------------------------------------------------------------------
   describe('constructor', () => {
     test('throws if baseUrl is missing', () => {
-      expect(() => new KaleidoswapProtocol(DUMMY_ACCOUNT, {}))
+      expect(() => new KaleidoswapProtocol(makeAccount(), {}))
         .toThrow('config.baseUrl is required')
     })
 
     test('strips trailing slash from baseUrl', () => {
-      globalThis.fetch = jest.fn() // provide a valid fetch for client creation
-      const p = new KaleidoswapProtocol(DUMMY_ACCOUNT, { baseUrl: 'https://api.example.com/' })
+      globalThis.fetch = jest.fn()
+      const p = new KaleidoswapProtocol(makeAccount(), { baseUrl: 'https://api.example.com/' })
       expect(p._baseUrl).toBe('https://api.example.com')
     })
   })
 
   // -------------------------------------------------------------------------
   describe('quoteSwap()', () => {
-    test('calls the correct endpoints and returns a shaped quote', async () => {
-      mockFetchSequence(
-        { assets: MOCK_ASSETS },  // GET /api/v1/market/assets
-        { pairs: MOCK_PAIRS },    // GET /api/v1/market/pairs
-        MOCK_QUOTE                // POST /api/v1/market/quote
-      )
+    test('POSTs the raw sell amount and returns a shaped quote', async () => {
+      mockFetchSequence(MOCK_QUOTE)
 
       const p = makeProtocol()
-      const result = await p.quoteSwap({
-        fromAssetId: BTC_ASSET_ID,
-        toAssetId: USDT_ASSET_ID,
-        fromLayer: 'BTC_LN',
-        toLayer: 'RGB_LN',
-        fromAmount: 0.01
-      })
+      const result = await p.quoteSwap(QUOTE_OPTS)
 
-      // Shape check
       expect(result.tokenInAmount).toBe(BigInt(MOCK_QUOTE.from_asset.amount))
       expect(result.tokenOutAmount).toBe(BigInt(MOCK_QUOTE.to_asset.amount))
       expect(result.rfqId).toBe('rfq-abc-123')
       expect(result.expiresAt).toBe(MOCK_QUOTE.expires_at)
       expect(result.price).toBe(MOCK_QUOTE.price)
-      expect(result.fee).toBe(BigInt(500))
+      expect(result.fee).toBe(BigInt(600)) // final_fee, not base_fee
 
-      // The quote POST must carry the right body
-      const quoteBody = await getRequestBody(2)
+      expect(getRequestUrl()).toContain('/api/v1/market/quote')
+      const quoteBody = await getRequestBody()
       expect(quoteBody.from_asset.asset_id).toBe(BTC_ASSET_ID)
       expect(quoteBody.from_asset.layer).toBe('BTC_LN')
-      // 0.01 BTC with precision 8 → 1_000_000 sats
+      // Raw units pass through untouched — no display-unit scaling.
       expect(quoteBody.from_asset.amount).toBe(1_000_000)
       expect(quoteBody.to_asset.asset_id).toBe(USDT_ASSET_ID)
-      expect(quoteBody.to_asset.layer).toBe('RGB_LN')
+      expect(quoteBody.to_asset.amount).toBeUndefined()
+    })
+
+    test('quotes a fixed buy via toAmount on the to leg', async () => {
+      mockFetchSequence(MOCK_QUOTE)
+
+      const p = makeProtocol()
+      await p.quoteSwap({ ...QUOTE_OPTS, fromAmount: undefined, toAmount: 950_000_000 })
+
+      const quoteBody = await getRequestBody()
+      expect(quoteBody.from_asset.amount).toBeUndefined()
+      expect(quoteBody.to_asset.amount).toBe(950_000_000)
+    })
+
+    test('rejects when both or neither amount is given', async () => {
+      globalThis.fetch = jest.fn()
+      const p = makeProtocol()
+      await expect(p.quoteSwap({ ...QUOTE_OPTS, toAmount: 1 }))
+        .rejects.toThrow(/exactly one of fromAmount or toAmount/)
+      await expect(p.quoteSwap({ ...QUOTE_OPTS, fromAmount: undefined }))
+        .rejects.toThrow(/exactly one of fromAmount or toAmount/)
+    })
+
+    test('rejects fractional amounts (display units passed by mistake)', async () => {
+      globalThis.fetch = jest.fn()
+      const p = makeProtocol()
+      await expect(p.quoteSwap({ ...QUOTE_OPTS, fromAmount: 0.01 }))
+        .rejects.toThrow(/raw base units/)
     })
   })
 
   // -------------------------------------------------------------------------
   describe('swap()', () => {
-    test('gets a quote then creates an order and returns the shaped result', async () => {
+    test('runs init → whitelist → execute and returns the shaped result', async () => {
       mockFetchSequence(
-        { assets: MOCK_ASSETS },  // GET assets (cache miss)
-        { pairs: MOCK_PAIRS },    // GET pairs  (cache miss)
-        MOCK_QUOTE,               // POST /api/v1/market/quote
-        MOCK_ORDER                // POST /api/v1/swaps/orders
+        MOCK_INIT, // POST /api/v1/swaps/init
+        MOCK_EXECUTE // POST /api/v1/swaps/execute
       )
 
-      const p = makeProtocol()
-      const result = await p.swap({
-        fromAssetId: BTC_ASSET_ID,
-        toAssetId: USDT_ASSET_ID,
-        fromLayer: 'BTC_LN',
-        toLayer: 'RGB_LN',
-        fromAmount: 0.01,
-        receiverAddress: 'rgb:invoice-example',
-        receiverAddressFormat: 'RGB_INVOICE'
+      const account = makeAccount()
+      const p = makeProtocol(account)
+      const result = await p.swap(SWAP_OPTS)
+
+      expect(result.hash).toBe('ph-abc-123')
+      expect(result.paymentHash).toBe('ph-abc-123')
+      expect(result.swapstring).toBe('swapstr-abc-123')
+      expect(result.accessToken).toBe('swap_tok_1')
+      expect(result.status).toBe('Waiting')
+      expect(result.tokenInAmount).toBe(BigInt(1_000_000))
+      expect(result.tokenOutAmount).toBe(BigInt(950_000_000))
+
+      // init payload carries the rfq_id and the exact quoted raw amounts
+      expect(getRequestUrl(0)).toContain('/api/v1/swaps/init')
+      const initBody = await getRequestBody(0)
+      expect(initBody).toEqual({
+        rfq_id: 'rfq-abc-123',
+        from_asset: BTC_ASSET_ID,
+        from_amount: 1_000_000,
+        to_asset: USDT_ASSET_ID,
+        to_amount: 950_000_000
       })
 
-      // SwapResult contract
-      expect(result.hash).toBe('order-xyz-789')
-      expect(result.orderId).toBe('order-xyz-789')
-      expect(result.depositAddress).toBe('lnbc10u1p...')
-      expect(result.depositAddressFormat).toBe('BOLT11')
-      expect(result.tokenInAmount).toBe(BigInt(MOCK_QUOTE.from_asset.amount))
-      expect(result.tokenOutAmount).toBe(BigInt(MOCK_QUOTE.to_asset.amount))
-      expect(result.fee).toBe(BigInt(500))
+      // whitelist happened on the taker node BEFORE execute
+      expect(account.atomicTaker).toHaveBeenCalledWith('swapstr-abc-123')
+      const whitelistOrder = account.atomicTaker.mock.invocationCallOrder[0]
+      const executeCall = globalThis.fetch.mock.invocationCallOrder[1]
+      expect(whitelistOrder).toBeLessThan(executeCall)
 
-      // Order creation payload
-      const orderBody = await getRequestBody(3)
-      expect(orderBody.rfq_id).toBe('rfq-abc-123')
-      expect(orderBody.from_asset.asset_id).toBe(BTC_ASSET_ID)
-      expect(orderBody.to_asset.asset_id).toBe(USDT_ASSET_ID)
-      expect(orderBody.receiver_address.address).toBe('rgb:invoice-example')
-      expect(orderBody.receiver_address.format).toBe('RGB_INVOICE')
-      expect(orderBody.min_onchain_conf).toBe(1)
+      // execute payload
+      expect(getRequestUrl(1)).toContain('/api/v1/swaps/execute')
+      const execBody = await getRequestBody(1)
+      expect(execBody).toEqual({
+        swapstring: 'swapstr-abc-123',
+        taker_pubkey: '02deadbeef',
+        payment_hash: 'ph-abc-123'
+      })
     })
 
-    test('returns null depositAddress when the order has none', async () => {
-      const orderNoDeposit = { id: 'ord-1', rfq_id: 'rfq-1', status: 'PENDING' }
-      mockFetchSequence(
-        { assets: MOCK_ASSETS },
-        { pairs: MOCK_PAIRS },
-        MOCK_QUOTE,
-        orderNoDeposit
-      )
-
+    test('requires the rfqId from quoteSwap()', async () => {
+      globalThis.fetch = jest.fn()
       const p = makeProtocol()
-      const result = await p.swap({
-        fromAssetId: BTC_ASSET_ID,
-        toAssetId: USDT_ASSET_ID,
-        fromLayer: 'BTC_LN',
-        toLayer: 'RGB_LN',
-        fromAmount: 0.01,
-        receiverAddress: 'rgb:invoice-example',
-        receiverAddressFormat: 'RGB_INVOICE'
-      })
+      await expect(p.swap({ ...SWAP_OPTS, rfqId: undefined }))
+        .rejects.toThrow(/requires the rfqId/)
+    })
 
-      expect(result.depositAddress).toBeNull()
-      expect(result.depositAddressFormat).toBeNull()
+    test('rejects fractional amounts before touching the maker', async () => {
+      globalThis.fetch = jest.fn()
+      const p = makeProtocol()
+      await expect(p.swap({ ...SWAP_OPTS, tokenInAmount: 0.01 }))
+        .rejects.toThrow(/raw base units/)
+      expect(globalThis.fetch).not.toHaveBeenCalled()
+    })
+
+    test('does not confirm execution when whitelisting fails', async () => {
+      mockFetchSequence(MOCK_INIT, MOCK_EXECUTE)
+      const account = makeAccount()
+      account.atomicTaker.mockRejectedValue(new Error('node unreachable'))
+      const p = makeProtocol(account)
+
+      await expect(p.swap(SWAP_OPTS)).rejects.toThrow('node unreachable')
+      // Only init hit the wire — execute never did.
+      expect(globalThis.fetch).toHaveBeenCalledTimes(1)
     })
   })
 
   // -------------------------------------------------------------------------
   describe('getOrderStatus()', () => {
-    test('POSTs to /api/v1/swaps/orders/status and returns the order object', async () => {
-      mockFetchSequence(MOCK_ORDER_STATUS)
+    test('POSTs to /api/v1/swaps/atomic/status and returns the swap object', async () => {
+      mockFetchSequence(MOCK_ATOMIC_STATUS)
       const p = makeProtocol()
-      const order = await p.getOrderStatus('order-xyz-789')
+      const swap = await p.getOrderStatus('ph-abc-123', 'swap_tok_1')
 
-      expect(order.id).toBe('order-xyz-789')
-      expect(order.status).toBe('FILLED')
+      expect(swap.payment_hash).toBe('ph-abc-123')
+      expect(swap.status).toBe('Succeeded')
 
-      expect(getRequestUrl()).toContain('/api/v1/swaps/orders/status')
+      expect(getRequestUrl()).toContain('/api/v1/swaps/atomic/status')
       expect(getRequestMethod()).toBe('POST')
       const body = await getRequestBody()
-      expect(body).toEqual({ order_id: 'order-xyz-789' })
+      expect(body).toEqual({ payment_hash: 'ph-abc-123', access_token: 'swap_tok_1' })
+    })
+
+    test('defaults access_token to empty when not supplied', async () => {
+      mockFetchSequence(MOCK_ATOMIC_STATUS)
+      const p = makeProtocol()
+      await p.getOrderStatus('ph-abc-123')
+      const body = await getRequestBody()
+      expect(body).toEqual({ payment_hash: 'ph-abc-123', access_token: '' })
     })
   })
 
   // -------------------------------------------------------------------------
-  describe('asset cache TTL', () => {
-    test('does not re-fetch assets/pairs within TTL', async () => {
+  describe('getAsset()', () => {
+    test('resolves by protocol ID and exposes precision', async () => {
       mockFetchSequence(
-        { assets: MOCK_ASSETS },  // 1st load
-        { pairs: MOCK_PAIRS },
-        MOCK_QUOTE,               // 1st quoteSwap
-        MOCK_QUOTE                // 2nd quoteSwap (assets cached — no extra GETs)
+        { assets: MOCK_ASSETS },
+        { pairs: MOCK_PAIRS }
       )
-
       const p = makeProtocol()
-
-      await p.quoteSwap({
-        fromAssetId: BTC_ASSET_ID,
-        toAssetId: USDT_ASSET_ID,
-        fromLayer: 'BTC_LN',
-        toLayer: 'RGB_LN',
-        fromAmount: 0.01
-      })
-
-      await p.quoteSwap({
-        fromAssetId: BTC_ASSET_ID,
-        toAssetId: USDT_ASSET_ID,
-        fromLayer: 'BTC_LN',
-        toLayer: 'RGB_LN',
-        fromAmount: 0.01
-      })
-
-      // 4 total calls: 2 for asset/pairs load + 2 for the two quotes
-      // If cache didn't work, we'd see 6 (2 loads + 2 loads + 2 quotes)
-      expect(globalThis.fetch).toHaveBeenCalledTimes(4)
+      const asset = await p.getAsset(USDT_ASSET_ID)
+      expect(asset.ticker).toBe('USDT')
+      expect(asset.precision).toBe(6)
     })
 
-    test('re-fetches assets/pairs after TTL expires', async () => {
+    test('caches assets/pairs within TTL', async () => {
       mockFetchSequence(
-        { assets: MOCK_ASSETS },  // 1st load
-        { pairs: MOCK_PAIRS },
-        MOCK_QUOTE,               // 1st quoteSwap
-        { assets: MOCK_ASSETS },  // 2nd load after TTL
-        { pairs: MOCK_PAIRS },
-        MOCK_QUOTE                // 2nd quoteSwap
+        { assets: MOCK_ASSETS },
+        { pairs: MOCK_PAIRS }
       )
-
       const p = makeProtocol()
+      await p.getAsset('BTC')
+      await p.getAsset('USDT')
+      expect(globalThis.fetch).toHaveBeenCalledTimes(2)
+    })
 
-      await p.quoteSwap({
-        fromAssetId: BTC_ASSET_ID,
-        toAssetId: USDT_ASSET_ID,
-        fromLayer: 'BTC_LN',
-        toLayer: 'RGB_LN',
-        fromAmount: 0.01
-      })
-
-      // Expire the cache
-      p._cacheTime = 0
-
-      await p.quoteSwap({
-        fromAssetId: BTC_ASSET_ID,
-        toAssetId: USDT_ASSET_ID,
-        fromLayer: 'BTC_LN',
-        toLayer: 'RGB_LN',
-        fromAmount: 0.01
-      })
-
-      expect(globalThis.fetch).toHaveBeenCalledTimes(6)
+    test('throws when asset is not found in catalog', async () => {
+      mockFetchSequence(
+        { assets: MOCK_ASSETS },
+        { pairs: MOCK_PAIRS }
+      )
+      const p = makeProtocol()
+      await expect(p.getAsset('UNKNOWN'))
+        .rejects.toThrow('KaleidoSwap: unknown asset "UNKNOWN"')
     })
   })
 
@@ -374,22 +393,6 @@ describe('KaleidoswapProtocol', () => {
       const p = makeProtocol()
       await expect(p.getOrderStatus('bad-id'))
         .rejects.toThrow()
-    })
-
-    test('throws when asset is not found in catalog', async () => {
-      mockFetchSequence(
-        { assets: MOCK_ASSETS },
-        { pairs: MOCK_PAIRS }
-      )
-
-      const p = makeProtocol()
-      await expect(p.quoteSwap({
-        fromAssetId: 'UNKNOWN',
-        toAssetId: USDT_ASSET_ID,
-        fromLayer: 'BTC_LN',
-        toLayer: 'RGB_LN',
-        fromAmount: 0.01
-      })).rejects.toThrow('KaleidoSwap: unknown asset "UNKNOWN"')
     })
   })
 })
