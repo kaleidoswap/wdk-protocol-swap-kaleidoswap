@@ -2,8 +2,6 @@
 
 WDK **SwapProtocol** plugin for [KaleidoSwap](https://kaleidoswap.com) — trade Bitcoin and RGB assets (USDT, XAU₮) on the Lightning Network with atomic swaps.
 
-Building on KaleidoSwap? See the [KaleidoSwap SDK & developer page](https://kaleidoswap.com/products/sdk).
-
 ## Overview
 
 `KaleidoswapProtocol` extends the WDK `SwapProtocol` base class and implements KaleidoSwap's **atomic HTLC swap flow**: quote → init → whitelist → execute → poll. Settlement is atomic over Lightning between the KaleidoSwap maker and the taker's own RGB Lightning Node (RLN): there is no deposit address and no receiver address.
@@ -197,3 +195,7 @@ Unit tests covering `quoteSwap`, `swap`, `getOrderStatus`, `getAsset`, and error
 ## License
 
 Apache-2.0 — [KaleidoSwap](https://kaleidoswap.com)
+
+---
+
+To build on KaleidoSwap, check the [KaleidoSDK page](https://kaleidoswap.com/products/sdk).
