@@ -1,4 +1,4 @@
-# @kaleidorg/wdk-protocol-swap-kaleidoswap
+# @kaleidoswap/wdk-protocol-swap-kaleidoswap
 
 WDK **SwapProtocol** plugin for [KaleidoSwap](https://kaleidoswap.com) — trade Bitcoin and RGB assets (USDT, XAU₮) on the Lightning Network with atomic swaps.
 
@@ -25,7 +25,7 @@ WDK host app
 ## Installation
 
 ```bash
-npm install @kaleidorg/wdk-protocol-swap-kaleidoswap
+npm install @kaleidoswap/wdk-protocol-swap-kaleidoswap
 ```
 
 Requires `@tetherto/wdk-wallet` as a peer dependency:
@@ -44,7 +44,7 @@ npm install @kaleidorg/wdk-wallet-rln
 
 ```js
 import RlnWalletManager from '@kaleidorg/wdk-wallet-rln'
-import KaleidoswapProtocol from '@kaleidorg/wdk-protocol-swap-kaleidoswap'
+import KaleidoswapProtocol from '@kaleidoswap/wdk-protocol-swap-kaleidoswap'
 
 const manager = new RlnWalletManager(null, { nodeUrl: 'http://localhost:3001' })
 const account = await manager.getAccount()
